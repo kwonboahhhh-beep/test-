@@ -20,7 +20,15 @@ def load_data(source):
     df = df.dropna(subset=["price", "quantity"]).copy()
     # 주문금액 = 가격 x 수량
     df["order_amount"] = df["price"] * df["quantity"]
-    return df
+
+    # 이상치 제거 (IQR 방법): 주문금액이 Q3 + 1.5*IQR 보다 크거나 Q1 - 1.5*IQR 보다 작은 행 삭제
+    n_before = len(df)
+    q1 = df["order_amount"].quantile(0.25)
+    q3 = df["order_amount"].quantile(0.75)
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    df = df[(df["order_amount"] >= lower) & (df["order_amount"] <= upper)].copy()
+    return df, n_before, lower, upper
 
 
 # ---------- 데이터 불러오기 ----------
@@ -38,7 +46,7 @@ if source is None:
     st.info("데이터 파일을 기다리는 중입니다.")
     st.stop()
 
-df = load_data(source)
+df, n_before, out_lower, out_upper = load_data(source)
 
 missing = {"price", "quantity"} - set(df.columns)
 if missing:
@@ -194,3 +202,13 @@ with st.expander("모델 성능 및 계수"):
 with st.expander("데이터 미리보기"):
     st.write(f"행 수: {len(df):,}")
     st.dataframe(df[["price", "quantity", "order_amount"]].head(50))
+
+with st.expander("데이터 전처리 (이상치 제거)"):
+    st.write(
+        f"IQR 방법으로 주문금액이 {out_upper:,.2f}보다 큰 주문을 이상치로 보고 삭제했어요."
+    )
+    n_removed = n_before - len(df)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("전처리 전", f"{n_before:,}행")
+    p2.metric("삭제된 이상치", f"{n_removed:,}행")
+    p3.metric("전처리 후", f"{len(df):,}행")
