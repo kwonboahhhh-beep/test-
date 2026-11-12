@@ -23,12 +23,13 @@ def load_data(source):
 
     # 이상치 제거 (IQR 방법): 주문금액이 Q3 + 1.5*IQR 보다 크거나 Q1 - 1.5*IQR 보다 작은 행 삭제
     n_before = len(df)
+    df_raw = df.copy()  # 이상치 제거 전 전체 데이터 (분석 그래프용)
     q1 = df["order_amount"].quantile(0.25)
     q3 = df["order_amount"].quantile(0.75)
     iqr = q3 - q1
     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     df = df[(df["order_amount"] >= lower) & (df["order_amount"] <= upper)].copy()
-    return df, n_before, lower, upper
+    return df, n_before, lower, upper, df_raw
 
 
 # ---------- 데이터 불러오기 ----------
@@ -46,7 +47,7 @@ if source is None:
     st.info("데이터 파일을 기다리는 중입니다.")
     st.stop()
 
-df, n_before, out_lower, out_upper = load_data(source)
+df, n_before, out_lower, out_upper, df_raw = load_data(source)
 
 missing = {"price", "quantity"} - set(df.columns)
 if missing:
@@ -183,6 +184,113 @@ compare = pd.DataFrame(
 )
 st.scatter_chart(compare, x="실제 주문금액", y="예측 주문금액")
 st.caption("점이 왼쪽 아래에서 오른쪽 위로 한 줄에 가깝게 모일수록 예측이 정확해요.")
+
+# ---------- 분석 그래프 ----------
+st.subheader("🔍 분석 그래프")
+
+# 분석 그래프 1: 가격 구간별 평균 수량
+st.markdown("**③ 가격 구간별 평균 수량**")
+st.caption("이상치를 제거하기 전 전체 데이터로 계산했어요. (큰 금액 주문이 빠지면 가격과 수량 관계가 왜곡돼요.)")
+edges = np.linspace(df_raw["price"].min(), df_raw["price"].max(), 6)  # 5개 구간
+bin_labels = [
+    f"{i + 1}구간 ({edges[i]:.0f}~{edges[i + 1]:.0f})" for i in range(5)
+]
+price_bin = pd.cut(df_raw["price"], bins=edges, labels=bin_labels, include_lowest=True)
+qty_by_price = df_raw.groupby(price_bin, observed=True)["quantity"].mean().rename("평균 수량")
+st.bar_chart(qty_by_price)
+q_high, q_low = qty_by_price.idxmax(), qty_by_price.idxmin()
+q_gap = qty_by_price.max() - qty_by_price.min()
+st.caption(
+    f"해석: 평균 수량이 가장 많은 구간은 {q_high}({qty_by_price.max():.2f}개), "
+    f"가장 적은 구간은 {q_low}({qty_by_price.min():.2f}개)로 차이는 {q_gap:.2f}개예요. "
+    "가격이 올라도 수량이 크게 줄지 않아요."
+    if q_gap < 0.3
+    else f"해석: 평균 수량이 가장 많은 구간은 {q_high}, 가장 적은 구간은 {q_low}로 "
+    f"차이가 {q_gap:.2f}개예요. 가격에 따라 수량이 달라지는 경향이 있어요."
+)
+
+# 분석 그래프 2: 고객 유형별 평균 주문금액
+st.markdown("**④ 고객 유형별 평균 주문금액**")
+if "customer_segment" in df.columns:
+    seg_avg = (
+        df.groupby("customer_segment")["order_amount"]
+        .mean()
+        .sort_values(ascending=False)
+        .rename("평균 주문금액")
+    )
+    st.bar_chart(seg_avg)
+    s_high, s_low = seg_avg.idxmax(), seg_avg.idxmin()
+    s_gap_pct = (seg_avg.max() - seg_avg.min()) / seg_avg.min() * 100
+    st.caption(
+        f"해석: 평균 주문금액이 가장 높은 고객 유형은 {s_high}({seg_avg.max():,.1f}), "
+        f"가장 낮은 유형은 {s_low}({seg_avg.min():,.1f})이고, 차이는 약 {s_gap_pct:.1f}%예요."
+        + (" 유형별 차이가 크지 않아요." if s_gap_pct < 10 else " 유형별로 차이가 있어요.")
+    )
+else:
+    st.info("customer_segment 열이 없어서 이 그래프를 그릴 수 없어요.")
+
+# ---------- 모델 성능 평가 (테스트 데이터에서 무작위 100개) ----------
+st.subheader("🧪 모델 성능 평가")
+st.caption("테스트 데이터에서 무작위로 100개를 뽑아, 모델의 예측이 얼마나 맞는지 계산해요.")
+
+if "eval_seed" not in st.session_state:
+    st.session_state.eval_seed = 0
+if "eval_show_all" not in st.session_state:
+    st.session_state.eval_show_all = False
+
+
+def resample():
+    st.session_state.eval_seed += 1
+
+
+def toggle_table():
+    st.session_state.eval_show_all = not st.session_state.eval_show_all
+
+
+e1, e2 = st.columns(2)
+e1.button("🔄 다시 뽑기", on_click=resample, use_container_width=True)
+e2.button(
+    "📂 100개 전체 보기" if not st.session_state.eval_show_all else "📁 표 닫기(앞 10행만)",
+    on_click=toggle_table,
+    use_container_width=True,
+)
+
+rng = np.random.default_rng(st.session_state.eval_seed)
+pick = rng.choice(len(y_test_actual), size=min(100, len(y_test_actual)), replace=False)
+ev_actual = y_test_actual[pick]
+ev_pred = y_test_pred[pick]
+
+ev_table = pd.DataFrame(
+    {
+        "실제값": ev_actual,
+        "예측값": ev_pred,
+        "오차(실제-예측)": ev_actual - ev_pred,
+        "절댓값": np.abs(ev_actual - ev_pred),
+        "제곱": (ev_actual - ev_pred) ** 2,
+    }
+).round(2)
+ev_table.index = range(1, len(ev_table) + 1)
+
+st.dataframe(
+    ev_table if st.session_state.eval_show_all else ev_table.head(10),
+    use_container_width=True,
+)
+if not st.session_state.eval_show_all:
+    st.caption("표는 앞 10행만 보여 주고 있어요. 계산은 100개 전체로 했어요.")
+
+ev_mae = float(np.abs(ev_actual - ev_pred).mean())
+ev_mse = float(((ev_actual - ev_pred) ** 2).mean())
+ev_ss_model = float(((ev_actual - ev_pred) ** 2).sum())
+ev_ss_mean = float(((ev_actual - ev_actual.mean()) ** 2).sum())
+ev_r2 = 1 - ev_ss_model / ev_ss_mean
+
+k1, k2, k3 = st.columns(3)
+k1.metric("MAE (평균 절대 오차)", f"{ev_mae:,.2f}")
+k2.metric("MSE (평균 제곱 오차)", f"{ev_mse:,.2f}")
+k3.metric("R²", f"{ev_r2:.4f}")
+st.caption(
+    f"R² = 1 - (모델의 제곱오차 합 {ev_ss_model:,.0f} ÷ 평균값 기준의 제곱오차 합 {ev_ss_mean:,.0f}) = {ev_r2:.4f}"
+)
 
 # ---------- 모델 정보 ----------
 with st.expander("모델 성능 및 계수"):
